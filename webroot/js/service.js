@@ -35,7 +35,7 @@ function Helper() {
 		/*
 		 * Apply style if the site has a blocker.
 		 */
-		if (blocker != null)
+		if (blocker !== null)
 			blocker.style.display = displayStyle;
 		
 	};
@@ -95,7 +95,7 @@ function Ajax() {
 			 * If we got a response, pass the response text to
 			 * the callback function.
 			 */
-			if (this.readyState == 4) {
+			if (this.readyState === 4) {
 				
 				/*
 				 * If we blocked the site on the request,
@@ -107,7 +107,7 @@ function Ajax() {
 				/*
 				 * Check if callback is registered.
 				 */
-				if (callback != null) {
+				if (callback !== null) {
 					var content = xhr.responseText;
 					callback(content);
 				}
@@ -216,12 +216,12 @@ function Handler() {
 			/*
 			 * Check if the response is valid JSON.
 			 */
-			if (webResponse != null) {
+			if (webResponse !== null) {
 				
 				/*
 				 * If we were not successful, log failed attempt, otherwise refresh rack.
 				 */
-				if (webResponse.Success != true) {
+				if (webResponse.Success !== true) {
 					var reason = webResponse.Reason;
 					var msg = 'No-op failed: ' + reason;
 					console.log(msg);
