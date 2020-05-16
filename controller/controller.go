@@ -186,7 +186,7 @@ func (this *controllerStruct) Operate() {
 		if server == nil {
 			fmt.Printf("%s\n", "Web server did not enter message loop.")
 		} else {
-			channels := server.RegisterCgi("/cgi-bin/service")
+			requests := server.RegisterCgi("/cgi-bin/service")
 			server.Run()
 			tlsPort := serverCfg.TLSPort
 			fmt.Printf("Web interface ready: https://localhost:%s/\n", tlsPort)
@@ -194,10 +194,10 @@ func (this *controllerStruct) Operate() {
 			/*
 			 * This is the actual message pump.
 			 */
-			for {
-				request := <-channels.Requests
+			for request := range requests {
 				response := this.dispatch(request)
-				channels.Responses <- response
+				respond := request.Respond
+				respond <- response
 			}
 
 		}

@@ -4,9 +4,14 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
+)
+
+const (
+	REQUEST_SIZE = 1 << 20
 )
 
 /*
@@ -18,6 +23,8 @@ type HttpRequest struct {
 	Path     string
 	Host     string
 	Params   map[string]string
+	Files    map[string][]multipart.File
+	Respond  chan<- HttpResponse
 }
 
 /*
@@ -26,15 +33,6 @@ type HttpRequest struct {
 type HttpResponse struct {
 	Header map[string]string
 	Body   []byte
-}
-
-/*
- * Data structure holding channels for communication between a CGI and the web
- * server.
- */
-type WebChannels struct {
-	Requests  chan HttpRequest
-	Responses chan HttpResponse
 }
 
 /*
@@ -57,7 +55,7 @@ type Config struct {
  * Data structure holding the web server's internal state.
  */
 type webServerStruct struct {
-	cgis   map[string]WebChannels
+	cgis   map[string]chan<- HttpRequest
 	config Config
 }
 
@@ -65,7 +63,7 @@ type webServerStruct struct {
  * The public interface of the web server.
  */
 type WebServer interface {
-	RegisterCgi(path string) WebChannels
+	RegisterCgi(path string) <-chan HttpRequest
 	GetCgis() []string
 	RemoveCgi(path string)
 	Run()
@@ -76,7 +74,7 @@ type WebServer interface {
  * in every handler. This sets a name for the server, a default MIME type, and
  * disables all forms of caching (local and via proxies).
  */
-func (this *webServerStruct) setDefaultHeaders(writer http.ResponseWriter, request *http.Request) {
+func (this *webServerStruct) setDefaultHeaders(writer http.ResponseWriter) {
 	cfg := this.config
 	srv := cfg.Name
 	mime := cfg.DefaultMime
@@ -91,34 +89,104 @@ func (this *webServerStruct) setDefaultHeaders(writer http.ResponseWriter, reque
  * A handler for CGI requests.
  */
 func (this *webServerStruct) cgiHandler(writer http.ResponseWriter, request *http.Request) {
-	request.ParseForm()
-
-	/*
-	 * The parsed HTTP request.
-	 */
-	hrequest := HttpRequest{
-		Protocol: request.Proto,
-		Method:   request.Method,
-		Path:     request.URL.Path,
-		Host:     request.Host,
-		Params:   map[string]string{},
-	}
+	request.ParseMultipartForm(REQUEST_SIZE)
+	protocol := request.Proto
+	method := request.Method
+	url := request.URL
+	path := url.Path
+	host := request.Host
+	params := make(map[string]string)
+	files := make(map[string][]multipart.File)
 
 	/*
 	 * Iterate over all form values and parse parameters.
 	 */
 	for key, values := range request.Form {
-		params := strings.Join(values, ",")
-		hrequest.Params[key] = params
+		ps := strings.Join(values, ",")
+		params[key] = ps
+	}
+
+	multipartForm := request.MultipartForm
+
+	/*
+	 * Check if a multipart form is available.
+	 */
+	if multipartForm != nil {
+		multipartFormValue := multipartForm.Value
+
+		/*
+		 * Iterate over values in multipart form.
+		 */
+		for key, values := range multipartFormValue {
+			ps := strings.Join(values, ",")
+			params[key] = ps
+		}
+
+		multipartFormFile := multipartForm.File
+
+		/*
+		 * Iterate over files in multipart form.
+		 */
+		for key, handles := range multipartFormFile {
+			fs := files[key]
+
+			/*
+			 * If no slice is present under this key, create one.
+			 */
+			if fs == nil {
+				fs = []multipart.File{}
+			}
+
+			/*
+			 * Iterate over each file handle for this key.
+			 */
+			for _, handle := range handles {
+
+				/*
+				 * Ensure that the handle is not nil.
+				 */
+				if handle != nil {
+					fd, err := handle.Open()
+
+					/*
+					 * If the handle points to a file, store file descriptor.
+					 */
+					if err == nil {
+						fs = append(fs, fd)
+					}
+
+				}
+
+			}
+
+			files[key] = fs
+		}
+
+	}
+
+	responseChannel := make(chan HttpResponse)
+
+	/*
+	 * The parsed HTTP request.
+	 */
+	hrequest := HttpRequest{
+		Protocol: protocol,
+		Method:   method,
+		Path:     path,
+		Host:     host,
+		Params:   params,
+		Files:    files,
+		Respond:  responseChannel,
 	}
 
 	/*
 	 * Interact with the CGI via channels to send request, fetch response.
 	 */
-	cgi := this.cgis[hrequest.Path]
-	cgi.Requests <- hrequest
-	response := <-cgi.Responses
-	this.setDefaultHeaders(writer, request)
+	cgis := this.cgis
+	cgi := cgis[path]
+	cgi <- hrequest
+	response := <-responseChannel
+	this.setDefaultHeaders(writer)
 	hdr := writer.Header()
 
 	/*
@@ -128,7 +196,8 @@ func (this *webServerStruct) cgiHandler(writer http.ResponseWriter, request *htt
 		hdr.Set(key, value)
 	}
 
-	writer.Write(response.Body)
+	body := response.Body
+	writer.Write(body)
 }
 
 /*
@@ -136,19 +205,21 @@ func (this *webServerStruct) cgiHandler(writer http.ResponseWriter, request *htt
  * content and images to be served.
  */
 func (this *webServerStruct) fileHandler(writer http.ResponseWriter, request *http.Request) {
-	url := request.URL.Path
-	this.setDefaultHeaders(writer, request)
+	url := request.URL
+	path := url.Path
+	this.setDefaultHeaders(writer)
 	cfg := this.config
 
 	/*
 	 * If navigated to web root, redirect to index file, otherwise serve file.
 	 */
-	if (url == "") || (url == "/") {
+	if (path == "") || (path == "/") {
 		hdr := writer.Header()
-		hdr.Set("Location", cfg.Index)
+		indexFile := cfg.Index
+		hdr.Set("Location", indexFile)
 		writer.WriteHeader(http.StatusFound)
 	} else {
-		dotPos := strings.LastIndex(url, ".")
+		dotPos := strings.LastIndex(path, ".")
 		extension := ""
 
 		/*
@@ -156,7 +227,7 @@ func (this *webServerStruct) fileHandler(writer http.ResponseWriter, request *ht
 		 */
 		if dotPos != -1 {
 			dotPosInc := dotPos + 1
-			extension = url[dotPosInc:]
+			extension = path[dotPosInc:]
 		}
 
 		mimetype, present := cfg.MimeTypes[extension]
@@ -168,16 +239,18 @@ func (this *webServerStruct) fileHandler(writer http.ResponseWriter, request *ht
 			mimetype = cfg.DefaultMime
 		}
 
-		path := cfg.WebRoot + url
-		fd, err := os.Open(path)
+		webRoot := cfg.WebRoot
+		filePath := webRoot + path
+		fd, err := os.Open(filePath)
 		hdr := writer.Header()
 
 		/*
 		 * Check if file exists in web root.
 		 */
 		if err != nil {
-			hdr.Set("Content-type", cfg.ErrorMime)
-			fmt.Fprintf(writer, "[ERROR] - '%s' does not exist!\n", url)
+			errorMime := cfg.ErrorMime
+			hdr.Set("Content-type", errorMime)
+			fmt.Fprintf(writer, "[ERROR] - '%s' does not exist!\n", path)
 		} else {
 			hdr.Set("Content-type", mimetype)
 			io.Copy(writer, fd)
@@ -193,18 +266,19 @@ func (this *webServerStruct) fileHandler(writer http.ResponseWriter, request *ht
 func (this *webServerStruct) redirect(writer http.ResponseWriter, request *http.Request) {
 	split := strings.SplitN(request.Host, ":", 2)
 	host := split[0]
-	this.setDefaultHeaders(writer, request)
+	this.setDefaultHeaders(writer)
 	uri := request.RequestURI
-	uriChars := []rune(uri)
 
 	/*
 	 * Ensure that the URI starts with a slash.
 	 */
-	if string(uriChars[0]) != "/" {
+	if !strings.HasPrefix(uri, "/") {
 		uri = "/" + uri
 	}
 
-	url := fmt.Sprintf("https://%s:%s%s", host, this.config.TLSPort, uri)
+	cfg := this.config
+	tlsPort := cfg.TLSPort
+	url := fmt.Sprintf("https://%s:%s%s", host, tlsPort, uri)
 	http.Redirect(writer, request, url, http.StatusFound)
 }
 
@@ -213,43 +287,45 @@ func (this *webServerStruct) redirect(writer http.ResponseWriter, request *http.
  * under which the CGI is available. When the CGI is called, the web server
  * generates a WebRequest and puts it into the request queue.
  */
-func (this *webServerStruct) RegisterCgi(path string) WebChannels {
+func (this *webServerStruct) RegisterCgi(path string) <-chan HttpRequest {
 	requests := make(chan HttpRequest)
-	responses := make(chan HttpResponse)
-	channels := WebChannels{Requests: requests, Responses: responses}
+	cgis := this.cgis
 
 	/*
 	 * If no CGI map exists, create one.
 	 */
-	if this.cgis == nil {
-		this.cgis = make(map[string]WebChannels)
+	if cgis == nil {
+		cgis = make(map[string]chan<- HttpRequest)
+		this.cgis = cgis
 	}
 
-	this.cgis[path] = channels
-	return channels
+	cgis[path] = requests
+	return requests
 }
 
 /*
  * Returns a list of the URLs of all currently registered CGIs.
  */
 func (this *webServerStruct) GetCgis() []string {
-	cgis := []string{}
+	cgis := this.cgis
+	cgisNew := []string{}
 
 	/*
 	 * Append all CGI paths to list.
 	 */
-	for path, _ := range this.cgis {
-		cgis = append(cgis, path)
+	for path, _ := range cgis {
+		cgisNew = append(cgisNew, path)
 	}
 
-	return cgis
+	return cgisNew
 }
 
 /*
  * Remove all CGIs currently registered with the web server.
  */
 func (this *webServerStruct) RemoveCgi(path string) {
-	delete(this.cgis, path)
+	cgis := this.cgis
+	delete(cgis, path)
 }
 
 /*
@@ -290,7 +366,8 @@ func (this *webServerStruct) Run() {
 	}
 
 	cfg := this.config
-	tlsAddr := fmt.Sprintf(":%s", cfg.TLSPort)
+	tlsPort := cfg.TLSPort
+	tlsAddr := fmt.Sprintf(":%s", tlsPort)
 
 	/*
 	 * The TLS server.
@@ -300,16 +377,21 @@ func (this *webServerStruct) Run() {
 		TLSConfig: &tlsConfig,
 	}
 
+	cgis := this.cgis
+
 	/*
 	 * Register all CGI paths to HTTP handler.
 	 */
-	for path, _ := range this.cgis {
+	for path, _ := range cgis {
 		http.HandleFunc(path, this.cgiHandler)
 	}
 
 	http.HandleFunc("/", this.fileHandler)
-	go tlsServer.ListenAndServeTLS(cfg.TLSPublicKey, cfg.TLSPrivateKey)
-	httpAddr := fmt.Sprintf(":%s", cfg.Port)
+	publicKey := cfg.TLSPublicKey
+	privateKey := cfg.TLSPrivateKey
+	httpPort := cfg.Port
+	go tlsServer.ListenAndServeTLS(publicKey, privateKey)
+	httpAddr := fmt.Sprintf(":%s", httpPort)
 	go http.ListenAndServe(httpAddr, http.HandlerFunc(this.redirect))
 }
 
