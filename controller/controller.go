@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/andrepxx/go-service/webserver"
-	"io/ioutil"
+	"os"
 )
 
 /*
@@ -55,10 +55,13 @@ func (this *controllerStruct) createJSON(obj interface{}) (string, []byte) {
 	 * Check if we got an error during marshalling.
 	 */
 	if err != nil {
+		conf := this.config
+		confServer := conf.WebServer
+		contentType := confServer.ErrorMime
 		errString := err.Error()
 		bufString := bytes.NewBufferString(errString)
 		bufBytes := bufString.Bytes()
-		return this.config.WebServer.ErrorMime, bufBytes
+		return contentType, bufBytes
 	} else {
 		return "application/json; charset=utf-8", buffer
 	}
@@ -95,13 +98,18 @@ func (this *controllerStruct) doNothingHandler(request webserver.HttpRequest) we
  * Handles requests that could not be dispatched to other handlers.
  */
 func (this *controllerStruct) errorHandler(request webserver.HttpRequest) webserver.HttpResponse {
+	conf := this.config
+	confServer := conf.WebServer
+	contentType := confServer.ErrorMime
+	msgBuf := bytes.NewBufferString("This CGI call is not implemented.")
+	msgBytes := msgBuf.Bytes()
 
 	/*
 	 * Create HTTP response.
 	 */
 	response := webserver.HttpResponse{
-		Header: map[string]string{"Content-type": this.config.WebServer.ErrorMime},
-		Body:   bytes.NewBufferString("This CGI call is not implemented.").Bytes(),
+		Header: map[string]string{"Content-type": contentType},
+		Body:   msgBytes,
 	}
 
 	return response
@@ -131,7 +139,7 @@ func (this *controllerStruct) dispatch(request webserver.HttpRequest) webserver.
  * Initialize the controller.
  */
 func (this *controllerStruct) initialize() error {
-	content, err := ioutil.ReadFile(CONFIG_PATH)
+	content, err := os.ReadFile(CONFIG_PATH)
 
 	/*
 	 * Check if file could be read.
